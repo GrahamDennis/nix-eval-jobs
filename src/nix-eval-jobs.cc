@@ -23,6 +23,7 @@
 #include <nix/installables.hh>
 #include <nix/path-with-outputs.hh>
 #include <nix/installable-flake.hh>
+#include <nix/eval-cache.hh>
 
 #include <nix/value-to-json.hh>
 
@@ -284,8 +285,7 @@ std::string attrPathJoin(json input) {
 static void worker(ref<EvalState> state, Bindings &autoArgs, AutoCloseFD &to,
                    AutoCloseFD &from) {
 
-    nix::Value *vRoot = [&]() {
-        if (myArgs.flake) {
+    auto vRoot = [&]() {
             auto [flakeRef, fragment, outputSpec] =
                 parseFlakeRefWithFragmentAndExtendedOutputsSpec(
                     myArgs.releaseExpr, absPath("."));
@@ -293,10 +293,9 @@ static void worker(ref<EvalState> state, Bindings &autoArgs, AutoCloseFD &to,
                 {}, state, std::move(flakeRef), fragment, outputSpec,
                 {}, {},    myArgs.lockFlags};
 
-            return flake.toValue(*state).first;
-        } else {
-            return releaseExprTopLevelValue(*state, autoArgs);
-        }
+            auto evalCache = nix::openEvalCache(*state, flake.getLockedFlake());
+
+            return evalCache->getRoot();
     }();
 
     while (true) {
@@ -316,11 +315,9 @@ static void worker(ref<EvalState> state, Bindings &autoArgs, AutoCloseFD &to,
         /* Evaluate it and send info back to the collector. */
         json reply = json{{"attr", attrPathS}, {"attrPath", path}};
         try {
-            auto vTmp =
-                findAlongAttrPath(*state, attrPathS, autoArgs, *vRoot).first;
+            auto vRef = vRoot->findAlongAttrPath(parseAttrPath(*state, attrPathS));
 
-            auto v = state->allocValue();
-            state->autoCallFunction(autoArgs, *vTmp, *v);
+            auto v = &(*vRef)->forceValue();
 
             if (v->type() == nAttrs) {
                 if (auto drvInfo = getDerivation(*state, *v, false)) {
@@ -370,6 +367,7 @@ static void worker(ref<EvalState> state, Bindings &autoArgs, AutoCloseFD &to,
                 }
             } else {
                 // We ignore everything that cannot be build
+                printError("worker process found nothing");
                 reply["attrs"] = nlohmann::json::array();
             }
         } catch (EvalError &e) {
